@@ -462,6 +462,78 @@ def create_event_embed(description, event_type, event_size, location, event_time
     embed.add_field(name="Duration", value=duration, inline=True)
     embed.add_field(name="Organized by", value=creator_name, inline=False)
     return embed
+class EventDetailView(discord.ui.View):
+    def __init__(self, event_id):
+        super().__init__(timeout=None)
+        self.event_id = event_id
+
+    @discord.ui.button(label="I'm Interested!", style=discord.ButtonStyle.primary)
+    async def interested_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await register_interest(interaction, self.event_id)
+
+    @discord.ui.button(label="Connect with Others", style=discord.ButtonStyle.success)
+    async def connect_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await toggle_connection_interest(interaction, self.event_id)
+
+@bot.command(name='detail')
+async def event_detail(ctx, event_id: int = None):
+    """Show detailed information about a specific event"""
+    if not event_id:
+        await ctx.send("Please provide an event ID. Example: `!detail 123`")
+        return
+
+    conn = sqlite3.connect('discord_bot.db')
+    c = conn.cursor()
+    
+    # Get event details
+    c.execute('''
+        SELECT e.creator_name, e.description, e.event_type, e.event_size, 
+               e.location, e.event_time, e.duration,
+               COUNT(DISTINCT i.user_id) as interested_count
+        FROM events e
+        LEFT JOIN event_interests i ON e.event_id = i.event_id
+        WHERE e.event_id = ?
+        GROUP BY e.event_id
+    ''', (event_id,))
+    
+    event = c.fetchone()
+    conn.close()
+    
+    if not event:
+        await ctx.send("❌ Event not found. Please check the event ID.")
+        return
+    
+    (creator_name, description, event_type, event_size, location, 
+     event_time, duration, interested_count) = event
+
+    # Parse event time
+    event_datetime = datetime.strptime(event_time, '%Y-%m-%d %H:%M:%S')
+    formatted_time = event_datetime.strftime('%Y-%m-%d %H:%M').replace(':', ';')
+
+    # Create embed with vertical green line design
+    embed = Embed(title="📅 Event Details", color=0x00ff00)
+    
+    # Description section
+    embed.add_field(name="Description", value=description, inline=False)
+    
+    # First row
+    embed.add_field(name="Type", value=event_type.title(), inline=True)
+    embed.add_field(name="Size", value=event_size.title(), inline=True)
+    embed.add_field(name="Location", value=location, inline=True)
+    
+    # Second row
+    embed.add_field(name="Date & Time", value=formatted_time, inline=True)
+    embed.add_field(name="Duration", value=duration, inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)  # Empty field for alignment
+    
+    # Organizer
+    embed.add_field(name="Organized by", value=creator_name, inline=False)
+
+    # Add buttons
+    view = EventDetailView(event_id)
+    
+    await ctx.send(embed=embed, view=view)
+
 
 
 @bot.command(name='events')
@@ -470,16 +542,52 @@ async def list_events(ctx, filter_type=None, *, filter_value=None):
     conn = sqlite3.connect('discord_bot.db')
     c = conn.cursor()
     
+    # Get user preferences
+    c.execute('''
+        SELECT preferred_types, preferred_sizes 
+        FROM user_preferences 
+        WHERE user_id = ?
+    ''', (str(ctx.author.id),))
+    
+    user_prefs = c.fetchone()
+    preferred_types = json.loads(user_prefs[0]) if user_prefs else []
+    preferred_sizes = json.loads(user_prefs[1]) if user_prefs else []
+    
+    # Base query with preference matching
     query = '''
-        SELECT e.event_id, e.creator_name, e.description, e.event_type, e.event_size, e.location,
-               e.event_time, e.duration,
-               COUNT(DISTINCT i.user_id) as interested_count
+        SELECT 
+            e.event_id, 
+            e.creator_name, 
+            e.description, 
+            e.event_type, 
+            e.event_size, 
+            e.location,
+            e.event_time, 
+            e.duration,
+            COUNT(DISTINCT i.user_id) as interested_count,
+            CASE 
+                WHEN e.event_type IN ({}) AND e.event_size IN ({}) THEN 1
+                WHEN e.event_type IN ({}) THEN 2
+                WHEN e.event_size IN ({}) THEN 2
+                ELSE 3
+            END as preference_match
         FROM events e
         LEFT JOIN event_interests i ON e.event_id = i.event_id
         WHERE datetime(e.event_time) >= datetime('now', 'localtime')
     '''
-    params = []
     
+    # Prepare preference parameters
+    type_placeholders = ','.join(['?' for _ in preferred_types]) if preferred_types else "''"
+    size_placeholders = ','.join(['?' for _ in preferred_sizes]) if preferred_sizes else "''"
+    
+    # Parameters for the preference matching
+    params = []
+    params.extend(preferred_types)
+    params.extend(preferred_sizes)
+    params.extend(preferred_types)
+    params.extend(preferred_sizes)
+    
+    # Add filter conditions if provided
     if filter_type and filter_value:
         if filter_type.lower() == 'type':
             query += ' AND LOWER(e.event_type) = LOWER(?)'
@@ -497,52 +605,80 @@ async def list_events(ctx, filter_type=None, *, filter_value=None):
                 conn.close()
                 return
     
-    query += ' GROUP BY e.event_id ORDER BY e.event_time ASC'
+    # Group by and order by preference match and time
+    query += ''' 
+        GROUP BY e.event_id 
+        ORDER BY 
+            preference_match ASC,
+            e.event_time ASC
+    '''
     
-    c.execute(query, params)
-    events = c.fetchall()
+    # Format query with placeholders
+    query = query.format(
+        type_placeholders, 
+        size_placeholders,
+        type_placeholders, 
+        size_placeholders
+    )
+    
+    try:
+        c.execute(query, params)
+        events = c.fetchall()
+    except sqlite3.Error as e:
+        await ctx.send(f"An error occurred while fetching events: {str(e)}")
+        conn.close()
+        return
     
     if not events:
         await ctx.send("No upcoming events found matching your criteria.")
         conn.close()
         return
+
+    # Create list view embed
+    embed = Embed(title="📅 Upcoming Events", color=0x00ff00)
     
-    # Create embeddings for events
-    embeds = []
+    # Format event list
+    event_list = []
     for event in events:
         (event_id, creator_name, description, event_type, event_size, location, 
-         event_time, duration, interested_count) = event
+         event_time, duration, interested_count, preference_match) = event
         
-        embed = Embed(title="📅 Event Details", color=0x00ff00)
-        embed.add_field(name="Description", value=description, inline=False)
-        embed.add_field(name="Type", value=event_type.title(), inline=True)
-        embed.add_field(name="Size", value=event_size.title(), inline=True)
-        embed.add_field(name="Location", value=location, inline=True)
-        
-        # Parse the event_time string into a datetime object first
+        # Parse event time
         event_datetime = datetime.strptime(event_time, '%Y-%m-%d %H:%M:%S')
         formatted_time = event_datetime.strftime('%Y-%m-%d %H:%M').replace(':', ';')
         
-        embed.add_field(name="Date & Time", value=formatted_time, inline=True)
-        embed.add_field(name="Duration", value=duration, inline=True)
-        embed.add_field(name="Interested", value=f"{interested_count} people", inline=True)
-        embed.add_field(name="Organized by", value=creator_name, inline=False)
-        embed.set_footer(text=f"Event ID: {event_id}")
+        # Add preference indicator
+        pref_indicator = "✨ " if preference_match == 1 else "⭐ " if preference_match == 2 else ""
         
-        embeds.append((embed, event_id))
+        # Format each event entry (limited to first 50 chars of description)
+        event_entry = f"**ID: {event_id}** {pref_indicator}\n"
+        event_entry += f"⏰ {formatted_time}\n"
+        event_entry += f"📍 {location}\n"
+        event_entry += f"💭 {description[:50]}{'...' if len(description) > 50 else ''}\n"
+        event_entry += f"👥 {interested_count} interested • {event_type} • {event_size}\n"
+        event_entry += "─" * 40 + "\n"  # Separator
+        
+        event_list.append(event_entry)
     
-    # Display events with pagination
+    # Split events into pages (5 events per page)
+    EVENTS_PER_PAGE = 5
+    pages = [event_list[i:i + EVENTS_PER_PAGE] for i in range(0, len(event_list), EVENTS_PER_PAGE)]
+    total_pages = len(pages)
     current_page = 0
-    total_pages = len(embeds)
     
     while True:
-        embed, event_id = embeds[current_page]
-        embed.set_footer(text=f"Event ID: {event_id} | Page {current_page + 1} of {total_pages}")
+        # Create embed for current page
+        embed = Embed(title="📅 Upcoming Events", color=0x00ff00)
+        embed.description = "".join(pages[current_page])
+        embed.set_footer(text=f"Page {current_page + 1} of {total_pages} • Use !detail <ID> to see full event details")
         
-        message = await ctx.send(
-            embed=embed,
-            view=EventView(event_id)
-        )
+        # Show filter if applied
+        if filter_type and filter_value:
+            embed.add_field(name="Active Filter", 
+                          value=f"{filter_type}: {filter_value}", 
+                          inline=False)
+        
+        message = await ctx.send(embed=embed)
         
         if total_pages > 1:
             await message.add_reaction('◀️')
