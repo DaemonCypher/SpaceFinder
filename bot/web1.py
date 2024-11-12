@@ -112,6 +112,30 @@ def setup_database():
             notification_enabled BOOLEAN
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS active_events (
+            event_id INTEGER PRIMARY KEY,
+            start_time TIMESTAMP,
+            end_time TIMESTAMP,
+            current_duration INTEGER,  -- in minutes
+            is_active BOOLEAN,
+            FOREIGN KEY (event_id) REFERENCES events (event_id)
+        )
+    ''')
+    
+    # Add new table for active participants
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS active_participants (
+            participant_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER,
+            user_id TEXT,
+            username TEXT,
+            join_time TIMESTAMP,
+            planned_duration INTEGER,  -- in minutes
+            actual_leave_time TIMESTAMP,
+            FOREIGN KEY (event_id) REFERENCES active_events (event_id)
+        )
+    ''')
     
     conn.commit()
     conn.close()
@@ -121,6 +145,313 @@ async def on_ready():
     print(f'{bot.user} has connected to Discord!')
     setup_database()
 
+class EventTimer:
+    def __init__(self, bot):
+        self.bot = bot
+        self.active_timers = {}
+        
+    async def start_timer(self, event_id, end_time, channel):
+        while datetime.now() < end_time:
+            await asyncio.sleep(60)  # Check every minute
+            
+            # Notify participants when 5 minutes remaining
+            remaining = (end_time - datetime.now()).total_seconds() / 60
+            if remaining <= 5:
+                await self.notify_participants(event_id, channel, remaining)
+                
+        await self.event_ended(event_id, channel)
+    
+    async def notify_participants(self, event_id, channel, remaining_minutes):
+        conn = sqlite3.connect('discord_bot.db')
+        c = conn.cursor()
+        
+        c.execute('''
+            SELECT user_id FROM active_participants
+            WHERE event_id = ? AND actual_leave_time IS NULL
+        ''', (event_id,))
+        
+        participants = c.fetchall()
+        conn.close()
+        
+        msg = f"⚠️ **Event ending in {int(remaining_minutes)} minutes!**"
+        await channel.send(msg)
+        
+        for participant in participants:
+            user = await self.bot.fetch_user(int(participant[0]))
+            try:
+                await user.send(f"⚠️ Event #{event_id} is ending in {int(remaining_minutes)} minutes!")
+            except:
+                pass
+    
+    async def event_ended(self, event_id, channel):
+        conn = sqlite3.connect('discord_bot.db')
+        c = conn.cursor()
+        
+        # Mark event as inactive
+        c.execute('''
+            UPDATE active_events
+            SET is_active = FALSE
+            WHERE event_id = ?
+        ''', (event_id,))
+        
+        # Auto-leave all remaining participants
+        current_time = datetime.now()
+        c.execute('''
+            UPDATE active_participants
+            SET actual_leave_time = ?
+            WHERE event_id = ? AND actual_leave_time IS NULL
+        ''', (current_time, event_id))
+        
+        conn.commit()
+        conn.close()
+        
+        await channel.send(f"🔚 **Event #{event_id} has ended!** Thank you for participating!")
+
+event_timer = EventTimer(bot)
+
+@bot.command(name='start')
+async def start_event(ctx, event_id: int, duration: int):
+    """Start an event with specified duration in minutes"""
+    conn = sqlite3.connect('discord_bot.db')
+    c = conn.cursor()
+    
+    # Check if user is the event organizer
+    c.execute('''
+        SELECT creator_id, description
+        FROM events
+        WHERE event_id = ?
+    ''', (event_id,))
+    
+    event = c.fetchone()
+    if not event:
+        await ctx.send("❌ Event not found.")
+        conn.close()
+        return
+    
+    if str(ctx.author.id) != event[0]:
+        await ctx.send("❌ Only the event organizer can start this event.")
+        conn.close()
+        return
+    
+    # Check if event is already active
+    c.execute('SELECT is_active FROM active_events WHERE event_id = ?', (event_id,))
+    active_event = c.fetchone()
+    if active_event and active_event[0]:
+        await ctx.send("❌ This event is already active!")
+        conn.close()
+        return
+    
+    start_time = datetime.now()
+    end_time = start_time + timedelta(minutes=duration)
+    
+    # Create or update active event
+    c.execute('''
+        INSERT OR REPLACE INTO active_events
+        (event_id, start_time, end_time, current_duration, is_active)
+        VALUES (?, ?, ?, ?, TRUE)
+    ''', (event_id, start_time, end_time, duration))
+    
+    conn.commit()
+    conn.close()
+    
+    embed = Embed(title="🎉 Event Started!", color=0x00ff00)
+    embed.add_field(name="Event", value=event[1], inline=False)
+    embed.add_field(name="Duration", value=f"{duration} minutes", inline=True)
+    embed.add_field(name="End Time", value=end_time.strftime("%H:%M"), inline=True)
+    embed.set_footer(text="Use !join to participate in the event")
+    
+    await ctx.send(embed=embed)
+    
+    # Start event timer
+    asyncio.create_task(event_timer.start_timer(event_id, end_time, ctx.channel))
+
+@bot.command(name='join')
+async def join_event(ctx, event_id: int, duration: int = None):
+    """Join an active event with optional planned duration"""
+    conn = sqlite3.connect('discord_bot.db')
+    c = conn.cursor()
+    
+    # Check if event is active
+    c.execute('''
+        SELECT end_time, current_duration
+        FROM active_events
+        WHERE event_id = ? AND is_active = TRUE
+    ''', (event_id,))
+    
+    active_event = c.fetchone()
+    if not active_event:
+        await ctx.send("❌ This event is not currently active.")
+        conn.close()
+        return
+    
+    # Check if user is already participating
+    c.execute('''
+        SELECT participant_id
+        FROM active_participants
+        WHERE event_id = ? AND user_id = ? AND actual_leave_time IS NULL
+    ''', (event_id, str(ctx.author.id)))
+    
+    if c.fetchone():
+        await ctx.send("❌ You are already participating in this event.")
+        conn.close()
+        return
+    
+    # Calculate max possible duration
+    max_duration = int((datetime.strptime(active_event[0], '%Y-%m-%d %H:%M:%S') - datetime.now()).total_seconds() / 60)
+    if duration is None or duration > max_duration:
+        duration = max_duration
+    
+    # Record participation
+    c.execute('''
+        INSERT INTO active_participants
+        (event_id, user_id, username, join_time, planned_duration)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (event_id, str(ctx.author.id), ctx.author.name, datetime.now(), duration))
+    
+    conn.commit()
+    conn.close()
+    
+    embed = Embed(title="✅ Joined Event", color=0x00ff00)
+    embed.add_field(name="Planned Duration", value=f"{duration} minutes", inline=True)
+    embed.add_field(name="Time Remaining", value=f"{max_duration} minutes", inline=True)
+    embed.set_footer(text="Use !leave to exit the event early")
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='status')
+async def event_status(ctx, event_id: int):
+    """Show current event status including participants and remaining time"""
+    conn = sqlite3.connect('discord_bot.db')
+    c = conn.cursor()
+    
+    # Get event details
+    c.execute('''
+        SELECT e.description, ae.start_time, ae.end_time, ae.current_duration,
+               COUNT(ap.participant_id) as participant_count
+        FROM events e
+        JOIN active_events ae ON e.event_id = ae.event_id
+        LEFT JOIN active_participants ap ON ae.event_id = ap.event_id AND ap.actual_leave_time IS NULL
+        WHERE e.event_id = ? AND ae.is_active = TRUE
+        GROUP BY e.event_id
+    ''', (event_id,))
+    
+    event = c.fetchone()
+    if not event:
+        await ctx.send("❌ This event is not currently active.")
+        conn.close()
+        return
+    
+    # Calculate remaining time
+    end_time = datetime.strptime(event[2], '%Y-%m-%d %H:%M:%S')
+    remaining_minutes = int((end_time - datetime.now()).total_seconds() / 60)
+    
+    # Get participant details
+    c.execute('''
+        SELECT username, join_time, planned_duration
+        FROM active_participants
+        WHERE event_id = ? AND actual_leave_time IS NULL
+        ORDER BY join_time
+    ''', (event_id,))
+    
+    participants = c.fetchall()
+    
+    embed = Embed(title="📊 Event Status", color=0x00ff00)
+    embed.add_field(name="Event", value=event[0], inline=False)
+    embed.add_field(name="Time Remaining", value=f"{remaining_minutes} minutes", inline=True)
+    embed.add_field(name="Participants", value=str(event[4]), inline=True)
+    
+    if participants:
+        participant_list = ""
+        for username, join_time, planned_duration in participants:
+            join_time = datetime.strptime(join_time, '%Y-%m-%d %H:%M:%S')
+            participant_list += f"**{username}** (Planned: {planned_duration} min)\n"
+        embed.add_field(name="Active Participants", value=participant_list, inline=False)
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='leave')
+async def leave_event(ctx, event_id: int):
+    """Leave an active event"""
+    conn = sqlite3.connect('discord_bot.db')
+    c = conn.cursor()
+    
+    # Check if user is participating
+    c.execute('''
+        SELECT participant_id, join_time
+        FROM active_participants
+        WHERE event_id = ? AND user_id = ? AND actual_leave_time IS NULL
+    ''', (event_id, str(ctx.author.id)))
+    
+    participant = c.fetchone()
+    if not participant:
+        await ctx.send("❌ You are not currently participating in this event.")
+        conn.close()
+        return
+    
+    # Record leave time
+    leave_time = datetime.now()
+    c.execute('''
+        UPDATE active_participants
+        SET actual_leave_time = ?
+        WHERE participant_id = ?
+    ''', (leave_time, participant[0]))
+    
+    # Calculate participation duration
+    join_time = datetime.strptime(participant[1], '%Y-%m-%d %H:%M:%S')
+    duration = int((leave_time - join_time).total_seconds() / 60)
+    
+    conn.commit()
+    conn.close()
+    
+    embed = Embed(title="👋 Left Event", color=0xff0000)
+    embed.add_field(name="Participation Duration", value=f"{duration} minutes", inline=True)
+    
+    await ctx.send(embed=embed)
+
+@bot.command(name='extend')
+async def extend_event(ctx, event_id: int, additional_minutes: int):
+    """Extend the duration of an active event"""
+    conn = sqlite3.connect('discord_bot.db')
+    c = conn.cursor()
+    
+    # Check if user is the organizer
+    c.execute('''
+        SELECT creator_id
+        FROM events
+        WHERE event_id = ?
+    ''', (event_id,))
+    
+    event = c.fetchone()
+    if not event or str(ctx.author.id) != event[0]:
+        await ctx.send("❌ Only the event organizer can extend the event duration.")
+        conn.close()
+        return
+    
+    # Update event duration
+    c.execute('''
+        UPDATE active_events
+        SET end_time = datetime(end_time, ? || ' minutes'),
+            current_duration = current_duration + ?
+        WHERE event_id = ? AND is_active = TRUE
+        RETURNING end_time
+    ''', (str(additional_minutes), additional_minutes, event_id))
+    
+    updated = c.fetchone()
+    if not updated:
+        await ctx.send("❌ This event is not currently active.")
+        conn.close()
+        return
+    
+    conn.commit()
+    conn.close()
+    
+    new_end_time = datetime.strptime(updated[0], '%Y-%m-%d %H:%M:%S')
+    
+    embed = Embed(title="⏰ Event Extended", color=0x00ff00)
+    embed.add_field(name="Additional Time", value=f"{additional_minutes} minutes", inline=True)
+    embed.add_field(name="New End Time", value=new_end_time.strftime("%H:%M"), inline=True)
+    
+    await ctx.send(embed=embed)
 class EventView(discord.ui.View):
     def __init__(self, event_id):
         super().__init__(timeout=None)
@@ -920,20 +1251,32 @@ async def cancel_interest(ctx, event_id: int = None):
 
 @bot.command(name='help')
 async def help_command(ctx):
-    """Show help information about the bot"""
+    """Show comprehensive help information about the bot"""
     embed = Embed(title="📚 Event Bot Help Guide", color=0x00ff00)
 
-    # Event Commands
-    event_commands = """
+    # Event Creation & Management
+    creation_commands = """
 `!schedule` - Create a new event
+`!detail <event_id>` - View detailed information about a specific event
 `!events` - View all upcoming events
-`!events type social` - View events filtered by type
-`!events size small` - View events filtered by size
-`!events date 2024-11-06` - View events for a specific date
+`!events type <type>` - View events filtered by type
+`!events size <size>` - View events filtered by size
+`!events date YYYY-MM-DD` - View events for a specific date
+`!myevents` - View all events you're interested in
 `!interested <event_id>` - View who's interested in an event
 `!cancelinterest <event_id>` - Cancel your interest in an event
 """
-    embed.add_field(name="🎯 Event Commands", value=event_commands.strip(), inline=False)
+    embed.add_field(name="📅 Event Creation & Management", value=creation_commands.strip(), inline=False)
+
+    # Active Event Commands
+    active_commands = """
+`!start <event_id> <duration>` - Start an event with specified duration in minutes
+`!join <event_id> [duration]` - Join an active event (optional: specify planned duration)
+`!leave <event_id>` - Leave an active event
+`!status <event_id>` - Check current event status and participants
+`!extend <event_id> <minutes>` - Extend an active event's duration
+"""
+    embed.add_field(name="⚡ Active Event Commands", value=active_commands.strip(), inline=False)
 
     # Preference Commands
     pref_commands = """
@@ -943,38 +1286,51 @@ async def help_command(ctx):
 """
     embed.add_field(name="⚙️ Preference Commands", value=pref_commands.strip(), inline=False)
 
-    # Event Types
-    types_str = ", ".join(EVENT_TYPES)
-    embed.add_field(name="📋 Available Event Types", value=types_str, inline=False)
+    # Event Types and Sizes
+    categories = f"""
+**Event Types:**
+{', '.join(EVENT_TYPES)}
 
-    # Event Sizes
-    sizes_str = """
-`small (1-5)` - Small gatherings
-`medium (6-15)` - Medium-sized events
-`large (16+)` - Large events
+**Event Sizes:**
+• Small (1-5) - Small gatherings
+• Medium (6-15) - Medium-sized events
+• Large (16+) - Large events
 """
-    embed.add_field(name="👥 Event Sizes", value=sizes_str.strip(), inline=False)
+    embed.add_field(name="📋 Categories", value=categories.strip(), inline=False)
 
     # Examples
     examples = """
-1. Create an event:
+1. Create and manage an event:
    `!schedule`
+   `!start 123 60` (Start event #123 for 60 minutes)
+   `!status 123` (Check event status)
 
-2. View events:
+2. View and filter events:
    `!events`
    `!events type gaming`
+   `!detail 123`
 
-3. Set preferences:
+3. Participate in events:
+   `!join 123 45` (Join event #123 for 45 minutes)
+   `!status 123` (Check who else is participating)
+   `!leave 123` (Leave when done)
+
+4. Set up preferences:
    `!setpreferences`
-
-4. View event participants:
-   `!interested 123`
+   `!viewpreferences`
 """
     embed.add_field(name="📝 Examples", value=examples.strip(), inline=False)
 
-    # Add Code of Conduct note
-    coc_note = "For detailed community guidelines, please refer to our Code of Conduct."
-    embed.set_footer(text=coc_note)
+    # Additional Info
+    additional_info = """
+• Use `!code` to view our full Code of Conduct
+• Event times should be entered in HH:MM format using semicolons (e.g., 14;30)
+• Durations can be specified in minutes or hours (e.g., "2 hours" or "30 minutes")
+"""
+    embed.add_field(name="ℹ️ Additional Information", value=additional_info.strip(), inline=False)
+
+    # Footer
+    embed.set_footer(text="For more details about any command, type !help <command>")
 
     await ctx.send(embed=embed)
 
